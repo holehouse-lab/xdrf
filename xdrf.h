@@ -11,6 +11,8 @@
  |
 */
 
+#ifndef XDRF_H
+#define XDRF_H
 
 // On Linux, xdrstdio_create is declared in <rpc/xdr.h> via libntirpc.
 // On macOS, the declaration is missing from the system headers, so we
@@ -49,8 +51,12 @@ int xdropen(XDR *xdrs, const char *filename, const char *type);
  * If the library allocated the XDR struct (xdropen called with
  * xdrs == NULL) it is freed here; otherwise the caller keeps ownership.
  *
- * Returns: 1 on success, 0 if xdrs is NULL or was not opened by
- *          xdropen. Versions before 1.6 called exit(1) in those cases.
+ * Returns: 1 on success, 0 if xdrs is NULL, was not opened by xdropen,
+ *          or the file hit an I/O error -- check this after writing,
+ *          because a full disk often only shows up when the final buffer
+ *          is flushed here. The file is closed in every case. Versions
+ *          before 1.6 called exit(1) for a bad stream, and versions up
+ *          to 1.6 ignored I/O errors here and reported success.
  */
 int xdrclose(XDR *xdrs) ;
 
@@ -80,16 +86,44 @@ int xdrclose(XDR *xdrs) ;
  *
  * Returns: 1 on success, 0 on failure.
  *
+ * On write, a frame of 10 or more atoms is checked in full before any of
+ * it is written, and refused (with nothing written) if the precision is
+ * not positive and finite, if any coordinate is NaN or infinite, if a
+ * scaled coordinate or coordinate range would not fit in 31 bits, or if
+ * a coordinate would read back as infinite (which only an absurdly small
+ * precision, such as a subnormal one, can cause).
+ *
  * WARNING: with *size == 0 the library writes as many triples as the
  * file asks for, and has no way to know how large fp is. Only use 0
  * when you can bound the atom count independently -- for an untrusted
- * or possibly corrupt file, read the count first (it is the first int
- * of the frame) and size fp from it, or pass the count you expect.
- * The C++ wrapper's read_3dfcoord() does the former for you.
+ * or possibly corrupt file, get the count with xdr3dfcoord_peek_size()
+ * and size fp from it, or pass the count you expect. The C++ wrapper's
+ * read_3dfcoord() does the former for you.
  *
  * Malformed input is rejected rather than followed: the atom count,
- * coordinate ranges, compression index, run lengths and compressed
- * block size found in the file are all validated before use.
+ * precision, coordinate ranges, compression index, run lengths and
+ * compressed block size found in the file are all validated before use.
  */
 int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) ;
+
+/*
+ * xdr3dfcoord_peek_size - Report the atom count of the next frame.
+ *
+ * Reads the count that starts the next xdr3dfcoord frame and restores the
+ * stream position, so the caller can allocate 3 * (*size) floats before
+ * calling xdr3dfcoord. Works at any file offset; rewinding by hand with
+ * xdr_getpos/xdr_setpos does not, because those carry the position in an
+ * unsigned int and wrap past 4 GiB.
+ *
+ * Parameters:
+ *   xdrs - XDR stream opened for reading with xdropen.
+ *   size - Receives the atom count as stored in the file (unvalidated;
+ *          xdr3dfcoord itself rejects bad counts).
+ *
+ * Returns: 1 on success, 0 if xdrs is not a read stream from xdropen or
+ *          there is no further frame (end of file).
+ */
+int xdr3dfcoord_peek_size(XDR *xdrs, int *size) ;
+
+#endif /* XDRF_H */
 

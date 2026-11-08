@@ -14,12 +14,15 @@ ifeq ($(UNAME_S),Darwin)
 ARCH     = darwin
 else
 ARCH     = linux
+# libtirpc where glibc no longer ships the RPC headers; see ../Makefile.
+TIRPC_CFLAGS := $(shell pkg-config --cflags libtirpc 2>/dev/null)
+TIRPC_LIBS   := $(shell pkg-config --libs libtirpc 2>/dev/null)
 endif
 
-CFLAGS   = -O -D$(ARCH) -I$(PARENT)
-CXXFLAGS = -O -std=c++17 -D$(ARCH) -I$(PARENT)
+CFLAGS   = -O -D$(ARCH) -I$(PARENT) $(TIRPC_CFLAGS)
+CXXFLAGS = -O -std=c++17 -D$(ARCH) -I$(PARENT) $(TIRPC_CFLAGS)
 FFLAGS   = -O3
-LIBS     = -lm
+LIBS     = -lm $(TIRPC_LIBS)
 
 TESTS    = test_xdrf test_fortran test_xdrf_cpp
 
@@ -27,17 +30,21 @@ TESTS    = test_xdrf test_fortran test_xdrf_cpp
 
 all: test
 
-# Ensure library is built first
-$(LIBXDRF):
+# Rebuild the library through the parent Makefile whenever one of its
+# sources changes. With no prerequisites here, an existing libxdrf.a was
+# always considered up to date, so the tests ran against a stale library.
+LIBSRCS  = $(PARENT)/libxdrf.m4 $(PARENT)/ftocstr.c $(PARENT)/xdrf.h
+
+$(LIBXDRF): $(LIBSRCS)
 	$(MAKE) -C $(PARENT) libxdrf.a
 
-test_xdrf: test_xdrf.c $(LIBXDRF)
+test_xdrf: test_xdrf.c $(LIBXDRF) $(PARENT)/xdrf.h
 	$(CC) -o $@ $(CFLAGS) $< $(LIBXDRF) $(LIBS)
 
 test_fortran: test_fortran.f $(LIBXDRF)
 	$(F77) -o $@ $(FFLAGS) $< $(LIBXDRF) $(LIBS)
 
-test_xdrf_cpp: test_xdrf_cpp.cpp $(LIBXDRF)
+test_xdrf_cpp: test_xdrf_cpp.cpp $(LIBXDRF) $(PARENT)/xdrf.h $(PARENT)/xdrf.hpp
 	$(CXX) -o $@ $(CXXFLAGS) $< $(LIBXDRF) $(LIBS)
 
 test: $(TESTS)

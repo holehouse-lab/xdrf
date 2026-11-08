@@ -10,6 +10,12 @@ ifeq ($(UNAME_S),Darwin)
 ARCH	= darwin
 else
 ARCH	= linux
+# glibc 2.32 and later no longer ship the Sun RPC headers (rpc/rpc.h,
+# rpc/xdr.h) or the xdr_* functions; libtirpc provides both. Use it when
+# pkg-config can find it, and otherwise fall back to glibc's own RPC, which
+# older systems such as Ubuntu 20.04 (glibc 2.31) still have.
+TIRPC_CFLAGS := $(shell pkg-config --cflags libtirpc 2>/dev/null)
+TIRPC_LIBS   := $(shell pkg-config --libs libtirpc 2>/dev/null)
 endif
 
 # Set FORTRAN compiler and flags for ARCH
@@ -22,8 +28,8 @@ CXX     = g++
 #F77     = ifort
 
 FFLAGS  = -O3 
-CFLAGS 	= -O -D$(ARCH)
-CXXFLAGS = -O -std=c++17 -D$(ARCH)
+CFLAGS 	= -O -D$(ARCH) $(TIRPC_CFLAGS)
+CXXFLAGS = -O -std=c++17 -D$(ARCH) $(TIRPC_CFLAGS)
 
 # Set C compiler and flags for ARCH
 #CC      = icc
@@ -36,7 +42,7 @@ HASRANLIB = f
 # Set LIBS to libraries to link your c program with
 # for SUN Solaris 2:
 # LIBS = -lnsl
-LIBS = 
+LIBS = $(TIRPC_LIBS)
 
 SHELL	= /bin/sh
 
@@ -82,13 +88,13 @@ libxdrf.a:  $(LFOBS) ftocstr.o
 	ar cr libxdrf.a $?
 	case x$(HASRANLIB) in xt ) echo ranlib; ranlib libxdrf.a ;; esac
 
-ctest:	ctest.c libxdrf.a 
+ctest:	ctest.c libxdrf.a xdrf.h
 	$(CC) -o ctest $(CFLAGS) ctest.c libxdrf.a -lm $(LIBS)
 
 ftest:	ftest.f libxdrf.a
 	$(F77) -o ftest $(FFLAGS) ftest.f libxdrf.a $(LIBS)
 
-cxxtest: cxxtest.cpp libxdrf.a xdrf.hpp
+cxxtest: cxxtest.cpp libxdrf.a xdrf.hpp xdrf.h
 	$(CXX) -o cxxtest $(CXXFLAGS) cxxtest.cpp libxdrf.a -lm $(LIBS)
 
 clean:
@@ -102,7 +108,7 @@ tidy:
 ftocstr.o: ftocstr.c
 	$(CC) $(CFLAGS) -c ftocstr.c
 
-libxdrf.o:	libxdrf.m4 $(M4FILE)
+libxdrf.o:	libxdrf.m4 $(M4FILE) xdrf.h
 	$(M4) $(M4FILE) libxdrf.m4 > libxdrf.c
 	$(CC) $(CFLAGS) -c libxdrf.c
 	$(RMCMD) libxdrf.c

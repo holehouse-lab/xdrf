@@ -3,8 +3,9 @@ c     test_fortran.f - Test suite for the xdrf Fortran interface.
 c
 c     Tests all Fortran wrapper functions: xdrfopen, xdrfclose,
 c     xdrfint, xdrffloat, xdrfdouble, xdrfshort, xdrfchar, xdrfbool,
-c     xdrf3dfcoord, xdrfstring, xdrfwrapstring, xdrfsetpos, xdrf,
-c     and xdrfvector.
+c     xdrflong, xdrfulong, xdrfopaque, xdrf3dfcoord, xdrfstring,
+c     xdrfwrapstring, xdrfsetpos, xdrf, and xdrfvector, plus the
+c     handling of an id that does not name an open file.
 c
 c     Exit code: 0 if all tests pass, 1 on failure.
 c     Prints PASS/FAIL for each test to stderr.
@@ -35,6 +36,13 @@ c     ================================================================
       call test_setpos_getpos(npass, nfail)
       call test_vector_float(npass, nfail)
       call test_reopen(npass, nfail)
+      call test_string_roundtrip(npass, nfail)
+      call test_opaque_roundtrip(npass, nfail)
+      call test_long_roundtrip(npass, nfail)
+      call test_vector_long(npass, nfail)
+      call test_vector_empty(npass, nfail)
+      call test_bad_handle(npass, nfail)
+      call test_wrapstring_too_long(npass, nfail)
 
       write(0,*) ''
       write(0,'(A,I3,A,I3,A,I3,A)') ' === Results: ',
@@ -691,6 +699,322 @@ c     ================================================================
       return
 
  900  write(0,*) '  test_reopen ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_string_roundtrip - xdrfstring and xdrfwrapstring, and
+c     ret = 0 (not -1) when xdrfstring is given a negative maxsize
+c     ================================================================
+      subroutine test_string_roundtrip(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret, maxsize
+      character*16 s, back
+
+      s = 'hello xdr'
+      maxsize = 16
+
+      call xdrfopen(xd, 'tmp_ftest_str.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfstring(xd, s, maxsize, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfwrapstring(xd, s, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      call xdrfopen(xd, 'tmp_ftest_str.xdr', 'r', ret)
+      if (ret .eq. 0) goto 900
+      back = 'xxxxxxxxxxxxxxxx'
+      call xdrfstring(xd, back, maxsize, ret)
+      if (ret .eq. 0 .or. back .ne. s) goto 900
+      back = 'xxxxxxxxxxxxxxxx'
+      call xdrfwrapstring(xd, back, ret)
+      if (ret .eq. 0 .or. back .ne. s) goto 900
+      call xdrfclose(xd, ret)
+
+      call xdrfopen(xd, 'tmp_ftest_str.xdr', 'r', ret)
+      maxsize = -1
+      ret = -99
+      call xdrfstring(xd, back, maxsize, ret)
+      if (ret .ne. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      write(0,*) '  test_string_roundtrip ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_string_roundtrip ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_opaque_roundtrip - xdrfopaque on an ordinary array. It used
+c     to take the first bytes of the data as an address and crash.
+c     ================================================================
+      subroutine test_opaque_roundtrip(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret, nbytes
+      real wbuf(2), rbuf(2)
+
+      wbuf(1) = 1.5
+      wbuf(2) = -2.25
+      rbuf(1) = 0.0
+      rbuf(2) = 0.0
+      nbytes = 8
+
+      call xdrfopen(xd, 'tmp_ftest_opaque.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfopaque(xd, wbuf, nbytes, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      call xdrfopen(xd, 'tmp_ftest_opaque.xdr', 'r', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfopaque(xd, rbuf, nbytes, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      if (rbuf(1) .ne. wbuf(1) .or. rbuf(2) .ne. wbuf(2)) goto 900
+
+      write(0,*) '  test_opaque_roundtrip ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_opaque_roundtrip ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_long_roundtrip - xdrflong and xdrfulong on default integers.
+c     They used to store 8 bytes into the 4-byte integer, zeroing the
+c     next variable. An xdr long is an xdr int on the wire, so the
+c     file must also read back with xdrfint.
+c     ================================================================
+      subroutine test_long_roundtrip(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret
+      integer vals(3), back(4)
+
+      vals(1) = 123456
+      vals(2) = -7
+      vals(3) = 2147483647
+
+      call xdrfopen(xd, 'tmp_ftest_long.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrflong(xd, vals(1), ret)
+      if (ret .eq. 0) goto 900
+      call xdrflong(xd, vals(2), ret)
+      if (ret .eq. 0) goto 900
+      call xdrfulong(xd, vals(3), ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+c     back(2) and back(4) are sentinels for the neighbour overwrite
+      back(1) = 0
+      back(2) = 777
+      back(3) = 0
+      back(4) = 888
+      call xdrfopen(xd, 'tmp_ftest_long.xdr', 'r', ret)
+      if (ret .eq. 0) goto 900
+      call xdrflong(xd, back(1), ret)
+      if (ret .eq. 0) goto 900
+      if (back(2) .ne. 777) goto 900
+      call xdrflong(xd, back(2), ret)
+      if (ret .eq. 0) goto 900
+      call xdrfulong(xd, back(3), ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+      if (back(1) .ne. vals(1)) goto 900
+      if (back(2) .ne. vals(2)) goto 900
+      if (back(3) .ne. vals(3)) goto 900
+      if (back(4) .ne. 888) goto 900
+
+      call xdrfopen(xd, 'tmp_ftest_long.xdr', 'r', ret)
+      back(1) = 0
+      call xdrfint(xd, back(1), ret)
+      call xdrfclose(xd, ret)
+      if (back(1) .ne. vals(1)) goto 900
+
+      write(0,*) '  test_long_roundtrip ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_long_roundtrip ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_vector_long - xdrfvector over xdrflong. The old 8-byte
+c     stride skipped every other element and wrote past the array.
+c     The integers share storage with a real array (equivalence)
+c     because gfortran rejects passing different types to the same
+c     external routine within one file.
+c     ================================================================
+      subroutine test_vector_long(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret, i, size
+      integer ivals(4), iback(5)
+      real rvals(4), rback(5)
+      equivalence (ivals, rvals), (iback, rback)
+      external xdrflong
+
+      size = 4
+      do i = 1, 4
+        ivals(i) = 10 * i
+      end do
+      do i = 1, 5
+        iback(i) = -1
+      end do
+
+      call xdrfopen(xd, 'tmp_ftest_veclong.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfvector(xd, rvals, size, xdrflong, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      call xdrfopen(xd, 'tmp_ftest_veclong.xdr', 'r', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfvector(xd, rback, size, xdrflong, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      do i = 1, 4
+        if (iback(i) .ne. ivals(i)) goto 900
+      end do
+      if (iback(5) .ne. -1) goto 900
+
+      write(0,*) '  test_vector_long ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_vector_long ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_vector_empty - xdrfvector with size 0 must report success;
+c     ret used to be left unset
+c     ================================================================
+      subroutine test_vector_empty(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret, size
+      real data(1)
+      external xdrffloat
+
+      size = 0
+      call xdrfopen(xd, 'tmp_ftest_vecempty.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      ret = -99
+      call xdrfvector(xd, data, size, xdrffloat, ret)
+      if (ret .ne. 1) goto 900
+      call xdrfclose(xd, ret)
+
+      write(0,*) '  test_vector_empty ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_vector_empty ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+
+c     ================================================================
+c     test_bad_handle - routines given an id that does not name an
+c     open file (from a failed open, or already closed) report
+c     ret = 0. They used to dereference a NULL stream and crash.
+c     ================================================================
+      subroutine test_bad_handle(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret, ival, pos, size
+      real rdummy(1)
+      external xdrffloat
+
+      ival = 0
+      call xdrfopen(xd, 'no_such_dir/tmp_ftest_x.xdr', 'r', ret)
+      if (ret .ne. 0) goto 900
+
+      ret = -99
+      call xdrfint(xd, ival, ret)
+      if (ret .ne. 0) goto 900
+      call xdrf(xd, pos)
+      if (pos .ne. -1) goto 900
+      ret = -99
+      call xdrfclose(xd, ret)
+      if (ret .ne. 0) goto 900
+
+      call xdrfopen(xd, 'tmp_ftest_bad.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+      ret = -99
+      call xdrfint(xd, ival, ret)
+      if (ret .ne. 0) goto 900
+c     an empty vector never calls the element routine, so xdrfvector
+c     has to check the id itself (it used to report success). The
+c     arguments match the other xdrfvector calls in this file, which
+c     gfortran 10 and later require.
+      size = 0
+      ret = -99
+      call xdrfvector(xd, rdummy, size, xdrffloat, ret)
+      if (ret .ne. 0) goto 900
+
+      write(0,*) '  test_bad_handle ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_bad_handle ... FAIL'
+      nfail = nfail + 1
+      return
+      end
+
+c     ================================================================
+c     test_wrapstring_too_long - a string one character longer than
+c     the variable it is read into must be refused, not truncated
+c     (xdrfwrapstring used to allow one extra character and drop it)
+c     ================================================================
+      subroutine test_wrapstring_too_long(npass, nfail)
+      implicit none
+      integer npass, nfail
+      integer xd, ret
+      character*10 s10
+      character*9 s9
+
+      s10 = 'ABCDEFGHIJ'
+      call xdrfopen(xd, 'tmp_ftest_wrap.xdr', 'w', ret)
+      if (ret .eq. 0) goto 900
+      call xdrfwrapstring(xd, s10, ret)
+      if (ret .eq. 0) goto 900
+      call xdrfclose(xd, ret)
+
+      call xdrfopen(xd, 'tmp_ftest_wrap.xdr', 'r', ret)
+      if (ret .eq. 0) goto 900
+      s9 = '?????????'
+      ret = -99
+      call xdrfwrapstring(xd, s9, ret)
+      if (ret .ne. 0 .or. s9 .ne. '?????????') goto 900
+      call xdrfclose(xd, ret)
+
+      write(0,*) '  test_wrapstring_too_long ... ok'
+      npass = npass + 1
+      return
+
+ 900  write(0,*) '  test_wrapstring_too_long ... FAIL'
       nfail = nfail + 1
       return
       end

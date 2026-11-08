@@ -32,8 +32,9 @@ Depending on your operating system you should also include
 This will open the file with the given \fIfilename\fR and the 
 given mode. You should pass it an allocated XDR struct
 in \fIxdrs\fR, to be used in all other calls to xdr routines.
-\fIMode\fR is 'w' to create, or update an file, and for all 
-other values of mode the file is opened for reading. 
+\fIMode\fR is "w" (or "W") to create or truncate a file for writing,
+"a" (or "A") to append to it, and any other value opens the file
+for reading.
 You need to call xdrclose to flush the output and close
 the file.
 .br
@@ -47,8 +48,12 @@ with the xdr libraries).
 .br
 If the library allocated the XDR struct (\fIxdrs\fR was NULL in the
 call to xdropen) it is freed here; otherwise the caller keeps
-ownership. Returns 1 on success and 0 if \fIxdrs\fR is NULL or was
-not opened by xdropen. Versions before 1.6 called exit(1) instead.
+ownership. Returns 1 on success and 0 if \fIxdrs\fR is NULL, was
+not opened by xdropen, or the file hit an I/O error. Check the result
+after writing: a full disk often only shows up when the final buffer
+is flushed here. The file is closed in every case. Versions before
+1.6 called exit(1) for a bad stream, and versions up to 1.6 ignored
+I/O errors.
  
 .SS "int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision)"
 This is \fInot\fR a standard xdr routine. I named it this 
@@ -77,8 +82,15 @@ count actually read.
 Beware that with \fI*size\fR set to zero the routine writes as many
 triplets as the file asks for and cannot tell how large \fIfp\fR is.
 Use zero only when the count is bounded by other means; for an
-untrusted file, read the count first (it is the first integer of the
-frame) and size \fIfp\fR from it.
+untrusted file, get the count with xdr3dfcoord_peek_size() and size
+\fIfp\fR from it.
+.br
+On write, a frame of ten or more triplets is checked in full before
+any of it is written, and refused (returning 0, with nothing written)
+if \fI*precision\fR is not positive and finite, if a coordinate is NaN
+or infinite, if a scaled coordinate or the scaled range along any axis
+does not fit in 31 bits, or if a coordinate would read back as
+infinite (which only an absurdly small precision can cause).
 .br
 \fI*precision\fR is set on read to the value stored in the file, except
 for frames of nine or fewer triplets, which are stored uncompressed
@@ -87,14 +99,25 @@ and carry no precision field.
 \fIfp\fR points to the coordinates which are stored in
 the order x0, y0, z0, x1, y1, z1, etc.
 
+.SS "int xdr3dfcoord_peek_size(XDR *xdrs, int *size)"
+Read the atom count that starts the next xdr3dfcoord frame into
+\fI*size\fR and restore the stream position, so a reader can allocate
+3 * \fI*size\fR floats first. Returns 1 on success, and 0 if
+\fIxdrs\fR is not a read stream opened by xdropen or there is no
+further frame. It works at any file offset; rewinding by hand with
+xdr_getpos and xdr_setpos does not, because they hold the offset in an
+unsigned int and go wrong past 4 GiB.
+
 
 .SH "FORTRAN USERS ONLY:"
 
 All FORTRAN routines use an integer 'xdrid', which is an id
 to the current xdr file, and is set by xdrfopen. Most 
 routines have in integer 'ret' which is the return value.
-The value of 'ret' is zero on failure, and most of the time 
-one on success.
+The value of 'ret' is zero on failure, and most of the time
+one on success. An xdrid that does not name an open file (such
+as the 0 left by a failed xdrfopen, or the id of a closed file)
+gives 'ret' zero and a message on standard error.
 
 .SS     xdrfopen(xdrid, filename, mode, ret)
 .B integer xdrid
@@ -108,8 +131,10 @@ one on success.
 This will open the file with the given filename (string)
 and the given mode. It returns an id in xdrid, which is
 to be used in all other calls to xdrf routines.
-Mode is 'w' to create, or update an file, and for all 
-other values of mode the file is opened for reading.
+Mode is 'w' (or 'W') to create or truncate a file for writing,
+\&'a' (or 'A') to append to it, and any other value opens the file
+for reading. The mode may be at most 2 characters and the filename
+at most 511 (trailing blanks aside); longer ones give ret = 0.
 You need to call xdrfclose to flush the output and close
 the file.
 .br
@@ -124,7 +149,8 @@ with the standard xdr library.
 Flush the data to the file, and close the file;
 You should not use xdr_destroy (which comes standard with
 the xdr libraries.
- 
+\fIret\fR is zero if writing the final data to disk failed.
+
 .SS "xdrfbool(xdrid, bp, ret)"
 .B integer xdrid
 .br
@@ -132,7 +158,7 @@ the xdr libraries.
 .br 
 .B integer ret
 .br
-This filter produces values of either 1 or 0.	
+This filter produces values of either 1 or 0.
  
 .SS "xdrfchar(xdrid, cp, ret)"
 .B integer xdrid
@@ -179,8 +205,9 @@ Read/write integer.
 .br
 .B integer ret
 .br
-This routine has a possible portablility problem due to 
-64 bit longs.
+Read/write a default (4 byte) integer as an xdr long, which is
+4 bytes on the wire. Versions up to 1.6 read and wrote 8 bytes
+through the integer on 64 bit systems.
 
 .SS "xdrfshort(xdrid, sp, ret)"
 .B integer xdrid
@@ -210,8 +237,9 @@ maxsize.
 .br
 .B integer ret
 .br
-Read/write a string (it is the same as xdrfstring except 
-that it finds the string length itself.
+Read/write a string (it is the same as xdrfstring except
+that it takes the length of \fIsp\fR as the maximum). On read, a
+string longer than \fIsp\fR gives ret = 0.
 
 .SS "xdrfvector(xdrid, cp, size, xdrfproc, ret)"
 .B integer xdrid
@@ -229,9 +257,11 @@ elements defined by 'size'. The routine 'xdrfproc' is the
 name of one of the above routines to read/write data 
 (such as xdrfdouble).
 .br
-In contrast with the C version you don't need to specify 
+In contrast with the C version you don't need to specify
 the byte size of an element.
 xdrfstring is not allowed here (it is in the C version).
+The routine stops at the first element that fails; \fIret\fR is
+one only if every element succeeded, and one for an empty vector.
 
 .SS "xdrfuchar(xdrid, ucp, ret)"
 .B integer xdrid
@@ -258,8 +288,8 @@ Read/write an unsigned short integer.
 .br
 .B integer ret
 .br
-Read/write an unsigned long integer. Has the same 64 bit portability
-caveat as xdrflong.
+Read/write a default integer as an xdr unsigned long, 4 bytes on
+the wire, as for xdrflong.
 
 .SS "xdrfopaque(xdrid, cp, ccnt, ret)"
 .B integer xdrid
@@ -283,6 +313,8 @@ is only portable between machines that agree on its layout.
 .br
 Seek to byte offset \fIpos\fR in the stream, as previously reported by
 xdrf. \fIret\fR is zero if the stream does not support seeking.
+Offsets are default integers, so only the first 2 GiB of a file can
+be reached.
 
 .SS "xdrf(xdrid, pos)"
 .B integer xdrid
@@ -291,7 +323,8 @@ xdrf. \fIret\fR is zero if the stream does not support seeking.
 .br
 Return the current byte offset in the stream in \fIpos\fR, for later
 use with xdrfsetpos. Note that this routine is named just "xdrf" and,
-unlike the others, takes no \fIret\fR argument.
+unlike the others, takes no \fIret\fR argument; \fIpos\fR is set to
+-1 if \fIxdrid\fR does not name an open file.
 
 .SS "xdrf3dfcoord(xdrid, fp, size, precision, ret)"
 .B integer xdrid
@@ -389,11 +422,11 @@ a set of 3d coordinates from a xdr file:
 .br
        integer xd, some_int, num_of_coord, ret
 .br
-       real *4 coord[3*100], prec
-.bl
+       real *4 coord(3*100), prec
+.br
        call xdrfopen(xd, "test.xdr", "r", ret)
 .br
-       if (ret.eq.0)
+       if (ret.eq.0) then
 .br
            call error
 .br
@@ -403,7 +436,7 @@ a set of 3d coordinates from a xdr file:
 .br
        prec = 1000.0
 .br
-       num_of_coord = 0
+       num_of_coord = 100
 .br
        call xdrf3dfcoord(xd, coord, num_of_coord, prec, ret)
 .br

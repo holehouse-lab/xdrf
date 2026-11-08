@@ -9,7 +9,9 @@
  |
 */
 
+#include <climits>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +19,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../xdrf.hpp"
@@ -50,7 +54,7 @@ static int tests_failed = 0;
 #define ASSERT_FLOAT_EQ(a, b, eps) do { \
     float _a = (a), _b = (b); \
     tests_run++; \
-    if (std::fabs(_a - _b) > eps) { \
+    if (!(std::fabs(_a - _b) <= eps)) {  /* written so that NaN fails */ \
         fprintf(stderr, "  FAIL: %s (line %d): expected %f, got %f (eps=%e)\n", \
                 __func__, __LINE__, (double)_b, (double)_a, (double)eps); \
         tests_failed++; \
@@ -61,7 +65,7 @@ static int tests_failed = 0;
 #define ASSERT_DOUBLE_EQ(a, b, eps) do { \
     double _a = (a), _b = (b); \
     tests_run++; \
-    if (std::fabs(_a - _b) > eps) { \
+    if (!(std::fabs(_a - _b) <= eps)) {  /* written so that NaN fails */ \
         fprintf(stderr, "  FAIL: %s (line %d): expected %f, got %f (eps=%e)\n", \
                 __func__, __LINE__, _b, _a, eps); \
         tests_failed++; \
@@ -624,6 +628,155 @@ static int test_compression_ratio(void) {
 
 
 /* ================================================================
+ * TEST: Robustness (regressions)
+ * ================================================================ */
+
+/* read_3dfcoord() peeks the atom count before reading. At the end of
+ * the file it must throw and leave the stream where it was. */
+static int test_read_3dfcoord_at_end(void) {
+    const char *f = "tmp_cpp_eof.xdr";
+    std::vector<float> coords(60);
+    for (int i = 0; i < 60; i++)
+        coords[i] = static_cast<float>(i) * 0.05f;
+    {
+        xdrf::XdrFile out(f, "w");
+        out.write_3dfcoord(coords, 1000.0f);
+    }
+    {
+        xdrf::XdrFile in(f, "r");
+        auto [result, rprec] = in.read_3dfcoord();
+        ASSERT_INT_EQ(static_cast<int>(result.size()), 60);
+        unsigned int at_end = in.getpos();
+        ASSERT_THROWS(in.read_3dfcoord(), std::runtime_error);
+        ASSERT_MSG(in.getpos() == at_end, "a failed peek must not move the stream");
+    }
+    cleanup(f);
+    return 0;
+}
+
+/* xdr_string stops at the first NUL, so the tail would be lost silently */
+static int test_write_string_rejects_nul(void) {
+    const char *f = "tmp_cpp_nul.xdr";
+    xdrf::XdrFile out(f, "w");
+    std::string with_nul("ab\0cd", 5);
+    ASSERT_THROWS(out.write_string(with_nul), std::runtime_error);
+    out.close();
+    cleanup(f);
+    return 0;
+}
+
+/* write_* on a read stream used to read instead (write_3dfcoord even into
+ * the caller's const vector), and read_* on a write stream used to write */
+static int test_direction_enforced(void) {
+    const char *f = "tmp_cpp_direction.xdr";
+    std::vector<float> coords(60);
+    for (int i = 0; i < 60; i++)
+        coords[i] = static_cast<float>(i) * 0.05f;
+    {
+        xdrf::XdrFile out(f, "w");
+        out.write_3dfcoord(coords, 1000.0f);
+        out.write_int(7);
+    }
+    {
+        xdrf::XdrFile in(f, "r");
+        const std::vector<float> mine(60, 5.0f);
+        ASSERT_THROWS(in.write_3dfcoord(mine, 1000.0f), std::runtime_error);
+        ASSERT_FLOAT_EQ(mine[3], 5.0f, 0.0f);
+        ASSERT_THROWS(in.write_int(99), std::runtime_error);
+        /* nothing was consumed: the frame and the int are still there */
+        auto [result, rprec] = in.read_3dfcoord();
+        ASSERT_INT_EQ(static_cast<int>(result.size()), 60);
+        ASSERT_INT_EQ(in.read_int(), 7);
+    }
+    {
+        xdrf::XdrFile out(f, "w");
+        ASSERT_THROWS(out.read_int(), std::runtime_error);
+        ASSERT_THROWS(out.read_3dfcoord(), std::runtime_error);
+        out.close();
+    }
+    FILE *fp = fopen(f, "rb");
+    ASSERT_MSG(fp != nullptr, "file should exist");
+    fseek(fp, 0, SEEK_END);
+    long bytes = ftell(fp);
+    fclose(fp);
+    ASSERT_MSG(bytes == 0, "a read on a write stream must not write");
+    cleanup(f);
+    return 0;
+}
+
+/* The atom count is peeked from the file and used to size the vector; a
+ * corrupt one used to be allocated unchecked (std::bad_alloc, not
+ * std::runtime_error, for a large one) */
+static int test_read_3dfcoord_bad_count(void) {
+    const char *f = "tmp_cpp_badcount.xdr";
+    const int counts[] = {-16, INT_MAX};
+    for (int c = 0; c < 2; c++) {
+        {
+            xdrf::XdrFile out(f, "w");
+            out.write_int(counts[c]);
+            for (int i = 0; i < 16; i++)
+                out.write_int(0);
+        }
+        xdrf::XdrFile in(f, "r");
+        ASSERT_THROWS(in.read_3dfcoord(), std::runtime_error);
+    }
+    cleanup(f);
+    return 0;
+}
+
+/* "W" is a documented write mode; xdr3dfcoord used to treat it as read */
+static int test_uppercase_mode_3dfcoord(void) {
+    const char *f = "tmp_cpp_upper.xdr";
+    std::vector<float> coords(60);
+    for (int i = 0; i < 60; i++)
+        coords[i] = static_cast<float>(i) * 0.03f;
+    {
+        xdrf::XdrFile out(f, "W");
+        out.write_3dfcoord(coords, 1000.0f);
+    }
+    {
+        xdrf::XdrFile in(f, "r");
+        auto [result, rprec] = in.read_3dfcoord();
+        ASSERT_INT_EQ(static_cast<int>(result.size()), 60);
+        for (int i = 0; i < 60; i++)
+            ASSERT_FLOAT_EQ(result[i], coords[i], 0.001f);
+    }
+    cleanup(f);
+    return 0;
+}
+
+/* close() must surface a write that only fails at the final flush. A
+ * file-size limit stands in for a full disk, in a child process so the
+ * limit stays out of the other tests. */
+static int test_close_reports_write_error(void) {
+    const char *f = "tmp_cpp_efbig.xdr";
+    pid_t child = fork();
+    ASSERT_MSG(child >= 0, "fork should succeed");
+    if (child == 0) {
+        struct rlimit rl;
+        rl.rlim_cur = rl.rlim_max = 1000;
+        signal(SIGXFSZ, SIG_IGN);  /* get EFBIG instead of being killed */
+        setrlimit(RLIMIT_FSIZE, &rl);
+        xdrf::XdrFile out(f, "w");
+        for (int i = 0; i < 500; i++)  /* 2000 bytes, twice the limit */
+            out.write_int(i);
+        try {
+            out.close();
+        } catch (const std::runtime_error &) {
+            _exit(0);  /* expected */
+        }
+        _exit(1);
+    }
+    int status = -1;
+    waitpid(child, &status, 0);
+    ASSERT_MSG(WIFEXITED(status), "child should exit normally");
+    ASSERT_INT_EQ(WEXITSTATUS(status), 0);
+    cleanup(f);
+    return 0;
+}
+
+
+/* ================================================================
  * main
  * ================================================================ */
 
@@ -661,6 +814,14 @@ int main() {
     RUN_TEST(test_setpos_getpos);
     RUN_TEST(test_append_mode);
     RUN_TEST(test_compression_ratio);
+
+    fprintf(stderr, "\n--- Robustness (regressions) ---\n");
+    RUN_TEST(test_read_3dfcoord_at_end);
+    RUN_TEST(test_write_string_rejects_nul);
+    RUN_TEST(test_uppercase_mode_3dfcoord);
+    RUN_TEST(test_close_reports_write_error);
+    RUN_TEST(test_direction_enforced);
+    RUN_TEST(test_read_3dfcoord_bad_count);
 
     fprintf(stderr, "\n=== Results: %d passed, %d failed, %d total ===\n\n",
             tests_passed, tests_failed, tests_run);

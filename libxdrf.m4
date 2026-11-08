@@ -3,7 +3,7 @@
  | libxdrf - portable fortran interface to xdr. some xdr routines
  |	     are C routines for compressed coordinates
  |
- | version 1.6
+ | version 1.7
  |
  | This collection of routines is intended to write and read
  | data in a portable way to a file, so data written on one type
@@ -13,13 +13,14 @@
  | current xdr file, and is set by xdrfopen.
  | most routines have in integer 'ret' which is the return value.
  | The value of 'ret' is zero on failure, and most of the time one
- | on succes.
+ | on succes. An xdrid that does not name an open file (for example
+ | the 0 left behind by a failed xdrfopen) gives ret = 0.
  |
- | There are three routines useful for C users:
- |  xdropen(), xdrclose(), xdr3dfcoord().
+ | There are four routines useful for C users:
+ |  xdropen(), xdrclose(), xdr3dfcoord(), xdr3dfcoord_peek_size().
  | The first two replace xdrstdio_create and xdr_destroy, and *must* be
  | used when you plan to use xdr3dfcoord(). (they are also a bit
- | easier to interface). For writing data other than compressed coordinates 
+ | easier to interface). For writing data other than compressed coordinates
  | you should use the standard C xdr routines (see xdr man page)
  |
  | xdrfopen(xdrid, filename, mode, ret)
@@ -29,8 +30,10 @@
  |	this will open the file with the given filename (string)
  |	and the given mode, it returns an id in xdrid, which is
  |	to be used in all other calls to xdrf routines.
- |	mode is 'w' to create, or update an file, for all other
- |	values of mode the file is opened for reading
+ |	mode is 'w' (or 'W') to create or truncate a file for writing,
+ |	'a' (or 'A') to append to it, and any other value opens the file
+ |	for reading. The mode may be at most 2 characters and the filename
+ |	at most 511 (trailing blanks aside); longer ones give ret = 0.
  |
  |	you need to call xdrfclose to flush the output and close
  |	the file.
@@ -41,7 +44,8 @@
  |	flush the data to the file, and closes the file;
  |	You should not use xdr_destroy (which comes standard with
  |	the xdr libraries.
- |	ret is 1 on success and 0 if xdrid does not name an open file.
+ |	ret is 1 on success and 0 if xdrid does not name an open file
+ |	or if the final flush to disk failed.
  |
  | xdrfbool(xdrid, bp, ret)
  |	integer pb
@@ -72,7 +76,8 @@
  | xdrflong(xdrid, lp, ret)
  |	integer lp
  |
- |	this routine has a possible portablility problem due to 64 bits longs.
+ |	read/write a default (4 byte) integer as an xdr long, which is
+ |	32 bits on the wire.
  |
  | xdrfshort(xdrid, sp, ret)
  |	integer *2 sp
@@ -132,8 +137,9 @@
  |	This will open the file with the given filename and the 
  |	given mode. You should pass it an allocated XDR struct
  |	in xdrs, to be used in all other calls to xdr routines.
- |	Mode is 'w' to create, or update an file, and for all 
- |	other values of mode the file is opened for reading. 
+ |	Mode is "w" (or "W") to create or truncate a file for writing,
+ |	"a" (or "A") to append to it, and any other value opens the
+ |	file for reading.
  |	You need to call xdrclose to flush the output and close
  |	the file.
  |
@@ -144,8 +150,9 @@
  |	Flush the data to the file, and close the file;
  |	You should not use xdr_destroy (which comes standard
  |	with the xdr libraries).
- |	Returns 1 on success, 0 if xdrs is NULL or was not opened
- |	by xdropen().
+ |	Returns 1 on success, 0 if xdrs is NULL, was not opened
+ |	by xdropen(), or the file hit an I/O error (check this after
+ |	writing: a full disk often first shows up in the final flush).
  |
  | int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision)
  |	This is \fInot\fR a standard xdr routine. I named it this
@@ -154,14 +161,30 @@
  |	See xdrf.h for the full description of *size and *precision,
  |	including the caveat about passing *size == 0 on read.
  |
+ | int xdr3dfcoord_peek_size(XDR *xdrs, int *size)
+ |	Report the atom count of the next frame without consuming it,
+ |	so a reader can size its buffer before calling xdr3dfcoord().
+ |
  |	(c) 1995 Frans van Hoesel, hoesel@chem.rug.nl
 */
 
 
 
+/* 64-bit file offsets for ftello()/fseeko() in xdr3dfcoord_peek_size(), so
+ * that it works past 2 GiB on 32-bit systems too. _LARGEFILE_SOURCE makes
+ * glibc declare ftello() and fseeko() in strict ISO modes (-std=c99, -std=c11)
+ * as well; without it they are implicitly declared there, ftello() comes back
+ * truncated to an int, and frames past 4 GiB are read from the wrong place.
+ * Both must precede every include.
+ */
+#define _FILE_OFFSET_BITS 64
+#define _LARGEFILE_SOURCE 1
+
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/types.h>
 #include <rpc/rpc.h>
 #include <rpc/xdr.h>
 #include <stdio.h>
@@ -187,9 +210,13 @@ int ctofstr(char *, int, char *);
  *               struct itself (the Fortran path, where xdropen() is called
  *               with xdrs == NULL) and so must free it on close; 0 if the
  *               caller owns the struct and is responsible for its memory.
- * xdrmodes[]  - The open mode character ('w', 'a', or 'r') for each file.
  * cnt         - Running byte counter used by the Fortran wrapper functions
  *               to track offsets within xdrfvector() iterations.
+ *
+ * Whether a stream reads or writes is taken from its own x_op field. A
+ * separate copy of the mode character used to be kept here, and it held
+ * whatever the caller passed: 'W' and 'A' opened a write stream that
+ * xdr3dfcoord() then treated as a read stream.
  *
  * Ownership used to be recorded in a single extra slot at xdridptr[MAXID]
  * that every xdropen() call overwrote, so the flag only ever described the
@@ -203,7 +230,6 @@ int ctofstr(char *, int, char *);
 static FILE *xdrfiles[MAXID];
 static XDR *xdridptr[MAXID];
 static char xdrowned[MAXID];
-static char xdrmodes[MAXID];
 static unsigned int cnt;
 
 /* Function pointer type for the Fortran element-processing callback
@@ -212,13 +238,54 @@ static unsigned int cnt;
  */
 typedef void (* FUNCTION(xdrfproc)) (int *, void *, int *);
 
+/* slot_of_stream - find the table slot that holds an open stream.
+ *
+ * Parameters:
+ *   xdrs - a stream pointer, possibly NULL.
+ *
+ * Returns the xdrid (1..MAXID-1) under which xdropen() registered xdrs,
+ * or 0 if xdrs is NULL or was not opened by xdropen(). Slot 0 is never
+ * used and is always NULL, so searching from 0 (as xdr3dfcoord once did)
+ * matched a NULL stream and then dereferenced it.
+ */
+static int slot_of_stream(XDR *xdrs) {
+    int xdrid;
+
+    if (xdrs == NULL)
+	return 0;
+    for (xdrid = 1; xdrid < MAXID; xdrid++) {
+	if (xdridptr[xdrid] == xdrs)
+	    return xdrid;
+    }
+    return 0;
+}
+
+/* stream_of_id - look up the stream for a Fortran xdrid.
+ *
+ * Parameters:
+ *   xdrid - pointer to the id that xdrfopen() handed out.
+ *
+ * Returns the stream, or NULL (after printing why) if the id does not name
+ * an open file. Every Fortran wrapper goes through this so that the id
+ * from a failed xdrfopen (0), a closed file, or an uninitialised variable
+ * gives ret = 0 instead of a NULL dereference or a read off the table.
+ */
+static XDR *stream_of_id(const int *xdrid) {
+    if (*xdrid < 1 || *xdrid >= MAXID || xdridptr[*xdrid] == NULL) {
+	fprintf(stderr, "xdrf: %d is not the id of an open xdr file\n", *xdrid);
+	return NULL;
+    }
+    return xdridptr[*xdrid];
+}
+
 /*___________________________________________________________________________
  |
  | Fortran wrapper functions
  |
  | These functions provide the Fortran-callable interface to XDR routines.
  | Each takes an xdrid (file handle index), the data to read/write, and
- | a ret pointer that receives 1 on success or 0 on failure.
+ | a ret pointer that receives 1 on success or 0 on failure. The xdrid
+ | is checked first (see stream_of_id), so a bad one also gives ret = 0.
  |
  | The FUNCTION() and ARGS() macros are expanded by m4 using the
  | architecture-specific config files in the conf directory to handle Fortran name
@@ -232,7 +299,8 @@ typedef void (* FUNCTION(xdrfproc)) (int *, void *, int *);
 void
 FUNCTION(xdrfbool) ARGS(`int *xdrid, int *pb, int *ret')
 {
-	*ret = xdr_bool(xdridptr[*xdrid], (bool_t *) pb);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_bool(xdrs, (bool_t *) pb);
 	cnt += sizeof(int);
 }
 
@@ -242,7 +310,8 @@ FUNCTION(xdrfbool) ARGS(`int *xdrid, int *pb, int *ret')
 void
 FUNCTION(xdrfchar) ARGS(`int *xdrid, char *cp, int *ret')
 {
-	*ret = xdr_char(xdridptr[*xdrid], cp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_char(xdrs, cp);
 	cnt += sizeof(char);
 }
 
@@ -250,7 +319,8 @@ FUNCTION(xdrfchar) ARGS(`int *xdrid, char *cp, int *ret')
 void
 FUNCTION(xdrfdouble) ARGS(`int *xdrid, double *dp, int *ret')
 {
-	*ret = xdr_double(xdridptr[*xdrid], dp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_double(xdrs, dp);
 	cnt += sizeof(double);
 }
 
@@ -258,7 +328,8 @@ FUNCTION(xdrfdouble) ARGS(`int *xdrid, double *dp, int *ret')
 void
 FUNCTION(xdrffloat) ARGS(`int *xdrid, float *fp, int *ret')
 {
-	*ret = xdr_float(xdridptr[*xdrid], fp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_float(xdrs, fp);
 	cnt += sizeof(float);
 }
 
@@ -266,32 +337,35 @@ FUNCTION(xdrffloat) ARGS(`int *xdrid, float *fp, int *ret')
 void
 FUNCTION(xdrfint) ARGS(`int *xdrid, int *ip, int *ret')
 {
-	*ret = xdr_int(xdridptr[*xdrid], ip);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_int(xdrs, ip);
 	cnt += sizeof(int);
 }
 
-/* xdrflong - Read/write a long integer.
- * On macOS (arm64/x86_64), long is 8 bytes but xdr_long() expects int*
- * (4 bytes), so we use a temporary int to avoid pointer type mismatch.
+/* xdrflong - Read/write a Fortran default INTEGER as an XDR long.
+ *
+ * An XDR long is a 4-byte signed integer on the wire -- the same encoding
+ * as an XDR int -- and the documented Fortran argument is a default
+ * (4-byte) INTEGER, so this is xdr_int() on an int. It used to take a C
+ * long: on every 64-bit platform that read 8 bytes from the caller's
+ * 4-byte integer and, on decode, wrote 8 bytes back, overwriting the
+ * neighbouring variable. Inside xdrfvector the 8-byte stride also skipped
+ * every other element and wrote past the end of the array.
  */
 void
-FUNCTION(xdrflong) ARGS(`int *xdrid, long *lp, int *ret')
+FUNCTION(xdrflong) ARGS(`int *xdrid, int *lp, int *ret')
 {
-#ifdef __APPLE__
-	int tmp = (int)*lp;
-	*ret = xdr_long(xdridptr[*xdrid], &tmp);
-	*lp = tmp;
-#else
-	*ret = xdr_long(xdridptr[*xdrid], lp);
-#endif
-	cnt += sizeof(long);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_int(xdrs, lp);
+	cnt += sizeof(int);
 }
 
 /* xdrfshort - Read/write a 16-bit short integer. */
 void
 FUNCTION(xdrfshort) ARGS(`int *xdrid, short *sp, int *ret')
 {
-	*ret = xdr_short(xdridptr[*xdrid], sp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_short(xdrs, sp);
 	cnt += sizeof(*sp);  /* stride in the caller's buffer, not the pointer size */
 }
 
@@ -299,31 +373,28 @@ FUNCTION(xdrfshort) ARGS(`int *xdrid, short *sp, int *ret')
 void
 FUNCTION(xdrfuchar) ARGS(`int *xdrid, unsigned char *ucp, int *ret')
 {
-	*ret = xdr_u_char(xdridptr[*xdrid], ucp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_u_char(xdrs, ucp);
 	cnt += sizeof(char);
 }
 
-/* xdrfulong - Read/write an unsigned long integer.
- * Same macOS workaround as xdrflong (see above).
+/* xdrfulong - Read/write a Fortran default INTEGER as an XDR unsigned long.
+ * Same reasoning as xdrflong: 4 bytes on the wire, 4 bytes in the caller.
  */
 void
-FUNCTION(xdrfulong) ARGS(`int *xdrid, unsigned long *ulp, int *ret')
+FUNCTION(xdrfulong) ARGS(`int *xdrid, unsigned int *ulp, int *ret')
 {
-#ifdef __APPLE__
-	unsigned int tmp = (unsigned int)*ulp;
-	*ret = xdr_u_long(xdridptr[*xdrid], &tmp);
-	*ulp = tmp;
-#else
-	*ret = xdr_u_long(xdridptr[*xdrid], ulp);
-#endif
-	cnt += sizeof(unsigned long);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_u_int(xdrs, ulp);
+	cnt += sizeof(unsigned int);
 }
 
 /* xdrfushort - Read/write an unsigned 16-bit short integer. */
 void
 FUNCTION(xdrfushort) ARGS(`int *xdrid, unsigned short *usp, int *ret')
 {
-	*ret = xdr_u_short(xdridptr[*xdrid], usp);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr_u_short(xdrs, usp);
 	cnt += sizeof(unsigned short);
 }
 
@@ -331,10 +402,11 @@ FUNCTION(xdrfushort) ARGS(`int *xdrid, unsigned short *usp, int *ret')
  * Delegates to the C xdr3dfcoord() function. See that function's
  * documentation for details on the compression algorithm.
  */
-void 
+void
 FUNCTION(xdrf3dfcoord) ARGS(`int *xdrid, float *fp, int *size, float *precision, int *ret')
 {
-	*ret = xdr3dfcoord(xdridptr[*xdrid], fp, size, precision);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdr3dfcoord(xdrs, fp, size, precision);
 }
 
 /* xdrfstring - Read/write a string with a specified maximum length.
@@ -346,29 +418,34 @@ FUNCTION(xdrf3dfcoord) ARGS(`int *xdrid, float *fp, int *size, float *precision,
  * because on decode xdr_string writes up to *maxsize bytes into it and
  * then null-terminates. Sizing the buffer from the Fortran string length
  * alone overflowed the heap whenever maxsize exceeded that length.
+ *
+ * Failures set ret to 0 like every other wrapper. They used to set -1,
+ * which a caller testing ret against 0 (as the documentation says to)
+ * took for success.
  */
 void
 FUNCTION(xdrfstring) ARGS(`int *xdrid, STRING_ARG(sp), int *maxsize, int *ret')
 {
+	XDR *xdrs = stream_of_id(xdrid);
 	char *tsp;
 	int bufsize;
 
-	if (*maxsize < 0) {
-	    *ret = -1;
+	if (xdrs == NULL || *maxsize < 0) {
+	    *ret = 0;
 	    return;
 	}
 	bufsize = (STRING_LEN(sp) > *maxsize ? STRING_LEN(sp) : *maxsize) + 1;
 	tsp = (char*) malloc(bufsize * sizeof(char));
 	if (tsp == NULL) {
-	    *ret = -1;
+	    *ret = 0;
 	    return;
 	}
 	if (ftocstr(tsp, bufsize, STRING_PTR(sp), STRING_LEN(sp))) {
-	    *ret = -1;
+	    *ret = 0;
 	    free(tsp);
 	    return;
 	}
-	*ret = xdr_string(xdridptr[*xdrid], (char **) &tsp, (u_int) *maxsize);
+	*ret = xdr_string(xdrs, (char **) &tsp, (u_int) *maxsize);
 	ctofstr( STRING_PTR(sp), STRING_LEN(sp), tsp);
 	cnt += *maxsize;
 	free(tsp);
@@ -379,25 +456,35 @@ FUNCTION(xdrfstring) ARGS(`int *xdrid, STRING_ARG(sp), int *maxsize, int *ret')
  * rather than requiring an explicit maxsize parameter.
  *
  * As above, the buffer needs maxsize + 1 bytes so that xdr_string can
- * null-terminate a maximum-length string on decode.
+ * null-terminate a maximum-length string on decode, and failures give 0.
+ *
+ * maxsize is the Fortran string's own length. It used to be one more, so
+ * reading a string one character too long for the variable succeeded and
+ * silently dropped its last character; now that read fails with ret = 0.
  */
 void
 FUNCTION(xdrfwrapstring) ARGS(`int *xdrid, STRING_ARG(sp), int *ret')
 {
+	XDR *xdrs = stream_of_id(xdrid);
 	char *tsp;
 	int maxsize;
-	maxsize = (STRING_LEN(sp)) + 1;
+
+	if (xdrs == NULL) {
+	    *ret = 0;
+	    return;
+	}
+	maxsize = STRING_LEN(sp);
 	tsp = (char*) malloc((maxsize + 1) * sizeof(char));
 	if (tsp == NULL) {
-	    *ret = -1;
+	    *ret = 0;
 	    return;
 	}
 	if (ftocstr(tsp, maxsize + 1, STRING_PTR(sp), STRING_LEN(sp))) {
-	    *ret = -1;
+	    *ret = 0;
 	    free(tsp);
 	    return;
 	}
-	*ret = xdr_string(xdridptr[*xdrid], (char **) &tsp, (u_int)maxsize);
+	*ret = xdr_string(xdrs, (char **) &tsp, (u_int)maxsize);
 	ctofstr( STRING_PTR(sp), STRING_LEN(sp), tsp);
 	cnt += maxsize;
 	free(tsp);
@@ -405,30 +492,41 @@ FUNCTION(xdrfwrapstring) ARGS(`int *xdrid, STRING_ARG(sp), int *ret')
 
 /* xdrfopaque - Read/write opaque (untyped) data of a fixed byte count.
  * The data is written as-is without any type conversion.
+ *
+ * cp is the address of the caller's data, as Fortran passes it. It used
+ * to be declared as a pointer to a pointer and dereferenced, which took
+ * the first bytes of the caller's data as an address -- so any ordinary
+ * call crashed or read and wrote through a garbage pointer.
  */
 void
-FUNCTION(xdrfopaque) ARGS(`int *xdrid, caddr_t *cp, int *ccnt, int *ret')
+FUNCTION(xdrfopaque) ARGS(`int *xdrid, char *cp, int *ccnt, int *ret')
 {
-	*ret = xdr_opaque(xdridptr[*xdrid], (caddr_t)*cp, (u_int)*ccnt);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && *ccnt >= 0
+	       && xdr_opaque(xdrs, (caddr_t)cp, (u_int)*ccnt);
 	cnt += *ccnt;
 }
 
 /* xdrfsetpos - Set the current position in the XDR stream.
- * Allows seeking to a specific byte offset for random access.
+ * Allows seeking to a specific byte offset for random access. Positions
+ * are default INTEGERs, so this only reaches the first 2 GiB of a file.
  */
 void
 FUNCTION(xdrfsetpos) ARGS(`int *xdrid, int *pos, int *ret')
 {
-	*ret = xdr_setpos(xdridptr[*xdrid], (u_int) *pos);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && *pos >= 0 && xdr_setpos(xdrs, (u_int) *pos);
 }
 
 /* xdrf - Get the current position in the XDR stream.
- * Returns the current byte offset in *pos.
+ * Returns the current byte offset in *pos, or -1 if xdrid does not name
+ * an open file (this routine has no ret argument to report that in).
  */
 void
 FUNCTION(xdrf) ARGS(`int *xdrid, int *pos')
 {
-	*pos = xdr_getpos(xdridptr[*xdrid]);
+	XDR *xdrs = stream_of_id(xdrid);
+	*pos = (xdrs != NULL) ? (int) xdr_getpos(xdrs) : -1;
 }
 
 /* xdrfvector - Read/write an array of elements using a callback.
@@ -438,13 +536,24 @@ FUNCTION(xdrf) ARGS(`int *xdrid, int *pos')
  * tracks the byte offset so each element is read from the
  * correct position in the buffer.
  * Note: xdrfstring cannot be used as the element procedure.
+ *
+ * ret is 1 if every element succeeded. The loop stops at the first
+ * failure, so ret cannot be reset to 1 by later elements, and an empty
+ * vector reports success; previously ret was never set when size was 0.
+ * The xdrid is checked here as well, so that an empty vector on a bad id
+ * gives ret = 0 like every other routine rather than a silent success.
  */
 void
 FUNCTION(xdrfvector) ARGS(`int *xdrid, char *cp, int *size, FUNCTION(xdrfproc) elproc, int *ret')
 {
 	int lcnt;
 	cnt = 0;
-	for (lcnt = 0; lcnt < *size; lcnt++) {
+	if (stream_of_id(xdrid) == NULL) {
+		*ret = 0;
+		return;
+	}
+	*ret = 1;
+	for (lcnt = 0; lcnt < *size && *ret != 0; lcnt++) {
 		elproc(xdrid, (cp+cnt) , ret);
 	}
 }
@@ -456,7 +565,8 @@ FUNCTION(xdrfvector) ARGS(`int *xdrid, char *cp, int *size, FUNCTION(xdrfproc) e
 void
 FUNCTION(xdrfclose) ARGS(`int *xdrid, int *ret')
 {
-	*ret = xdrclose(xdridptr[*xdrid]);
+	XDR *xdrs = stream_of_id(xdrid);
+	*ret = (xdrs != NULL) && xdrclose(xdrs);
 	cnt = 0;
 }
 
@@ -478,11 +588,15 @@ FUNCTION(xdrfopen) ARGS(`int *xdrid, STRING_ARG(fp), STRING_ARG(mode), int *ret'
 	 */
 	*xdrid = 0;
 	if (ftocstr(fname, sizeof(fname), STRING_PTR(fp), STRING_LEN(fp))) {
+		fprintf(stderr, "xdrfopen: file name is longer than %d "
+			"characters\n", (int) sizeof(fname) - 1);
 		*ret = 0;
 		return;
 	}
 	if (ftocstr(fmode, sizeof(fmode), STRING_PTR(mode),
 			STRING_LEN(mode))) {
+		fprintf(stderr, "xdrfopen: mode must be at most %d characters, "
+			"e.g. 'r', 'w' or 'a'\n", (int) sizeof(fmode) - 1);
 		*ret = 0;
 		return;
 	}
@@ -512,9 +626,6 @@ FUNCTION(xdrfopen) ARGS(`int *xdrid, STRING_ARG(fp), STRING_ARG(mode), int *ret'
 #endif
 #ifndef MAX
 #define MAX(x,y) ((x) > (y) ? (x):(y))
-#endif
-#ifndef SQR
-#define SQR(x) ((x)*(x))
 #endif
 /* Lookup table of "magic" integers used for adaptive compression.
  * These values define the range of the small-integer encoding at
@@ -595,7 +706,6 @@ int xdropen(XDR *xdrs, const char *filename, const char *type) {
     if (xdrfiles[xdrid] == NULL) {
 	return 0;
     }
-    xdrmodes[xdrid] = *type;
     /* Determine whether this is a Fortran or C call.
      * Fortran calls pass xdrs == NULL, so the library allocates the XDR
      * struct itself and records that it must free it again on close.
@@ -627,41 +737,102 @@ int xdropen(XDR *xdrs, const char *filename, const char *type) {
  | It also closes the associated file descriptor (this is *not*
  | done by xdr_destroy).
  |
- | Returns 1 on success and 0 if xdrs is NULL or does not refer to a
- | stream opened by xdropen(). Earlier versions called exit(1) in those
- | two cases, which tore down the whole calling program over a recoverable
- | error; the Fortran wrapper already reports the result through 'ret'.
+ | Returns 1 on success and 0 if xdrs is NULL, does not refer to a
+ | stream opened by xdropen(), or the file reported an I/O error. Earlier
+ | versions called exit(1) in the first two cases, which tore down the
+ | whole calling program over a recoverable error; the Fortran wrapper
+ | already reports the result through 'ret'.
+ |
+ | The I/O check matters for writers: the xdr routines only fill the stdio
+ | buffer, so a full disk or a file size limit often first shows up when
+ | that buffer is flushed here. Ignoring it, as earlier versions did,
+ | reported success for a file that was silently truncated. The stream is
+ | closed and its slot released whatever the outcome.
  |
 */
 
 int xdrclose(XDR *xdrs) {
     int xdrid;
+    int io_ok;
+    FILE *file;
 
     if (xdrs == NULL) {
 	fprintf(stderr, "xdrclose: passed a NULL pointer\n");
 	return 0;
     }
-    for (xdrid = 1; xdrid < MAXID; xdrid++) {
-	if (xdridptr[xdrid] == xdrs) {
-
-	    xdr_destroy(xdrs);      /* Flush and destroy the XDR stream */
-	    fclose(xdrfiles[xdrid]); /* Close the underlying file */
-	    xdrfiles[xdrid] = NULL;
-
-            /* Only free the XDR struct if this library allocated it
-             * (the Fortran path); otherwise the caller owns the memory.
-             */
-	    if (xdrowned[xdrid]) {
-	       	free(xdridptr[xdrid]);
-            }
-            xdrowned[xdrid] = 0;
-            xdridptr[xdrid] = NULL;
-            return 1;
-	}
+    xdrid = slot_of_stream(xdrs);
+    if (xdrid == 0) {
+	fprintf(stderr, "xdrclose: no such open xdr file\n");
+	return 0;
     }
-    fprintf(stderr, "xdrclose: no such open xdr file\n");
-    return 0;
 
+    file = xdrfiles[xdrid];
+    xdr_destroy(xdrs);              /* Flushes the stdio buffer */
+    io_ok = (ferror(file) == 0);    /* Any earlier read/write error, or the flush */
+    if (fclose(file) != 0)          /* Close the underlying file */
+	io_ok = 0;
+    if (!io_ok)
+	fprintf(stderr, "xdrclose: I/O error on xdr file; "
+		"data read or written may be incomplete\n");
+    xdrfiles[xdrid] = NULL;
+
+    /* Only free the XDR struct if this library allocated it
+     * (the Fortran path); otherwise the caller owns the memory.
+     */
+    if (xdrowned[xdrid]) {
+	free(xdridptr[xdrid]);
+    }
+    xdrowned[xdrid] = 0;
+    xdridptr[xdrid] = NULL;
+    return io_ok;
+}
+
+/*_________________________________________________________________________
+ |
+ | xdr3dfcoord_peek_size - report the atom count of the next frame
+ |
+ | Reads the count that starts the next xdr3dfcoord frame and puts the
+ | stream back where it was, so a reader can size its buffer first.
+ |
+ | Parameters:
+ |   xdrs - a stream opened for reading with xdropen().
+ |   size - receives the atom count as stored in the file. It is not
+ |          validated here; xdr3dfcoord() rejects bad counts.
+ |
+ | Returns 1 on success, 0 if xdrs is not a read stream from xdropen(),
+ | there is no further frame, or the position cannot be restored.
+ |
+ | The rewind uses ftello()/fseeko() on the underlying file rather than
+ | xdr_getpos()/xdr_setpos(). The xdr position calls carry the offset in
+ | an unsigned int, so past 4 GiB they returned the offset modulo 2^32 and
+ | rewound to the wrong place -- a routine size for a trajectory.
+ |
+*/
+
+int xdr3dfcoord_peek_size(XDR *xdrs, int *size) {
+    int xdrid = slot_of_stream(xdrs);
+    FILE *file;
+    off_t start;
+    int read_ok;
+
+    if (xdrid == 0) {
+	fprintf(stderr, "xdr3dfcoord_peek_size: no such open xdr file\n");
+	return 0;
+    }
+    if (xdrs->x_op != XDR_DECODE) {
+	fprintf(stderr, "xdr3dfcoord_peek_size: stream is not open for reading\n");
+	return 0;
+    }
+    file = xdrfiles[xdrid];
+    start = ftello(file);
+    if (start < 0)
+	return 0;
+    read_ok = xdr_int(xdrs, size);
+    /* Rewind even after a failed read: hitting the end of the file must
+     * not leave the stream in a different place, or flagged as at EOF. */
+    if (fseeko(file, start, SEEK_SET) != 0)
+	return 0;
+    return read_ok;
 }
 
 /*____________________________________________________________________________
@@ -673,20 +844,26 @@ int xdrclose(XDR *xdrs) {
  | better make sure that this number of bits is enough to hold the value
  | Also num must be positive.
  |
+ | num_of_bits may exceed 32: sendints() pads with sendbits(buf, n, 0) for
+ | up to 64 bits. Shifting an int by 32 or more is undefined behaviour, so
+ | those high chunks are taken as 0 explicitly -- which is what the shift
+ | of a value below 2^32 means, and what the hardware happened to produce.
+ |
 */
 
 static void sendbits(int buf[], int num_of_bits, int num) {
-    
+
     unsigned int cnt, lastbyte;
-    int lastbits;
+    int lastbits, shift;
     unsigned char * cbuf;
-    
+
     cbuf = ((unsigned char *)buf) + 3 * sizeof(*buf);
     cnt = (unsigned int) buf[0];
     lastbits = buf[1];
     lastbyte =(unsigned int) buf[2];
     while (num_of_bits >= 8) {
-	lastbyte = (lastbyte << 8) | ((num >> (num_of_bits -8)) /* & 0xff*/);
+	shift = num_of_bits - 8;
+	lastbyte = (lastbyte << 8) | (shift >= 32 ? 0 : (num >> shift));
 	cbuf[cnt++] = lastbyte >> lastbits;
 	num_of_bits -= 8;
     }
@@ -883,13 +1060,20 @@ static int receivebits(int buf[], int num_of_bits) {
  | the given sizes[]. You need to specify the total number of bits to be
  | used from buf in num_of_bits.
  |
+ | The arithmetic is unsigned. With signed ints, (num << 8) overflowed
+ | once a remainder reached 2^23 -- any axis range above about 8.4e6
+ | scaled units, e.g. 8.4 nm at a precision of 1e6 -- as did
+ | (bytes[3] << 24); both are undefined behaviour. Every value fits in
+ | 32 bits unsigned, so the results are unchanged.
+ |
 */
 
 static void receiveints(int buf[], const int num_of_ints, int num_of_bits,
 	unsigned int sizes[], int nums[]) {
-    int bytes[32];
-    int i, j, num_of_bytes, p, num;
-    
+    unsigned int bytes[32];
+    unsigned int p, num;
+    int i, j, num_of_bytes;
+
     bytes[1] = bytes[2] = bytes[3] = 0;
     num_of_bytes = 0;
     while (num_of_bits > 8) {
@@ -907,9 +1091,9 @@ static void receiveints(int buf[], const int num_of_ints, int num_of_bits,
 	    bytes[j] = p;
 	    num = num - p * sizes[i];
 	}
-	nums[i] = num;
+	nums[i] = (int)num;
     }
-    nums[0] = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+    nums[0] = (int)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24));
 }
     
 /* Scratch buffers shared by all xdr3dfcoord() calls.
@@ -955,6 +1139,15 @@ static int ensure_buffers(int size) {
 	return 0;
     }
     newbufints = (int)(size3 * 1.2) + 3;
+    /* On a 32-bit system the byte counts below can exceed SIZE_MAX, and
+     * realloc() would then be handed a wrapped, much smaller size.
+     * newbufints is the larger of the two element counts, so checking it
+     * covers both allocations.
+     */
+    if ((size_t) newbufints > SIZE_MAX / sizeof(*coord_buf)) {
+	fprintf(stderr, "xdr3dfcoord: %d atoms is too many\n", size);
+	return 0;
+    }
 
     newip = (int *) realloc(coord_ip, size3 * sizeof(*coord_ip));
     if (newip == NULL) {
@@ -1000,6 +1193,128 @@ static int xdr_float_array(XDR *xdrs, float *fp, unsigned int n) {
 
 /*____________________________________________________________________________
  |
+ | scale_coordinate - convert one coordinate to the fixed-point integer form
+ |
+ | Parameters:
+ |   value     - the coordinate, in whatever units the caller uses.
+ |   precision - the fixed-point multiplier (e.g. 1000 for 3 decimals).
+ |   scaled    - receives value * precision rounded half away from zero.
+ |
+ | Returns 1 on success and 0 if the scaled value is NaN, infinite, or
+ | larger in magnitude than MAXABS. The range has to be checked before the
+ | conversion to int: converting an out-of-range float is undefined
+ | behaviour, and in practice NaN came out as 0 on arm64, so a NaN
+ | coordinate was silently written as zero and the call reported success.
+ | The arithmetic is exactly that of earlier versions, so in-range values
+ | scale to the same integers bit for bit.
+ |
+*/
+
+static int scale_coordinate(float value, float precision, int *scaled) {
+    float lf;
+
+    if (value >= 0.0)
+	lf = value * precision + 0.5;
+    else
+	lf = value * precision - 0.5;
+    /* Written as !(x <= max) so that NaN, which fails every comparison,
+     * is rejected along with the values that are merely too large. */
+    if (!(fabs(lf) <= MAXABS))
+	return 0;
+    *scaled = (int) lf;
+    return 1;
+}
+
+/*____________________________________________________________________________
+ |
+ | wrapped_int - reinterpret a 32-bit unsigned value as a two's-complement int
+ |
+ | Converting an unsigned value above INT_MAX straight to int is
+ | implementation-defined, so the negative range is rebuilt explicitly.
+ |
+*/
+
+static int wrapped_int(unsigned int value) {
+    if (value <= (unsigned int) INT_MAX)
+	return (int) value;
+    return -(int)(UINT_MAX - value) - 1;
+}
+
+/*____________________________________________________________________________
+ |
+ | wrapped_sqr_distance - squared distance between two scaled coordinates,
+ |                        with 32-bit wraparound
+ |
+ | Parameters:
+ |   a, b - two coordinate triples in scaled (fixed-point) units.
+ |
+ | Returns (a-b).(a-b) reduced modulo 2^32 and read as a signed int.
+ |
+ | The writer uses this distance only to decide whether a run of small
+ | differences lets it step down to a finer compression level, and the
+ | decision itself is written into the stream, so any answer yields a valid
+ | frame that every reader decodes the same way. Earlier versions (and
+ | other XTC writers built from this code) computed it in plain int, which
+ | overflows for precisions around 1e5 and above. That was undefined
+ | behaviour, and what it produced depended on the compiler: GNU gcc at
+ | any optimisation level, and clang without optimisation, wrapped and
+ | compared the results as signed ints; optimised clang assumed no
+ | overflow and compared the same bits as unsigned. Doing the arithmetic
+ | in unsigned, where wrapping is defined, and comparing as signed
+ | reproduces the gcc result exactly. Frames are therefore byte-identical
+ | to gcc builds of earlier versions -- the usual way they were built on
+ | Linux -- and no longer depend on the compiler.
+ |
+*/
+
+static int wrapped_sqr_distance(const int a[3], const int b[3]) {
+    unsigned int dx = (unsigned int) a[0] - (unsigned int) b[0];
+    unsigned int dy = (unsigned int) a[1] - (unsigned int) b[1];
+    unsigned int dz = (unsigned int) a[2] - (unsigned int) b[2];
+
+    return wrapped_int(dx * dx + dy * dy + dz * dz);
+}
+
+/*____________________________________________________________________________
+ |
+ | wrapped_manhattan_distance - |a-b| summed over the three axes, with 32-bit
+ |                              wraparound
+ |
+ | Parameters:
+ |   a, b - two coordinate triples in scaled (fixed-point) units.
+ |
+ | Returns the sum reduced modulo 2^32 and read as a signed int.
+ |
+ | The writer takes the smallest of these distances between consecutive
+ | atoms to pick the initial compression index, which it writes into the
+ | frame. Earlier versions summed the three per-axis distances in int.
+ | Above INT_MAX that overflowed -- undefined behaviour, which every gcc
+ | build tested (gcc 7 and 9 at -O0 to -O3) wrapped to a negative number.
+ | That negative number then won the minimum and pinned the index at
+ | FIRSTIDX. It takes only one pair of consecutive atoms more than 2^31
+ | scaled units apart (about 2.1 um at a precision of 1e6). Reproducing
+ | the wrap in unsigned arithmetic keeps those frames byte-identical to
+ | gcc builds of earlier versions, as wrapped_sqr_distance() does for the
+ | step-down heuristic. Summing exactly instead changed the bytes of such
+ | frames (though not what they decode to).
+ |
+ | Each per-axis distance is below 2^31 in any frame that passes the range
+ | check; frames where it is not are refused before anything is written,
+ | so what this returns for them does not matter.
+ |
+*/
+
+static int wrapped_manhattan_distance(const int a[3], const int b[3]) {
+    unsigned int sum = 0;
+    int k;
+
+    for (k = 0; k < 3; k++)
+	sum += (unsigned int) llabs((long long) a[k] - b[k]);
+    return wrapped_int(sum);
+}
+
+/*____________________________________________________________________________
+ |
  | xdr3dfcoord - read or write compressed 3d coordinates to xdr file.
  |
  | this routine reads or writes (depending on how you opened the file with
@@ -1034,10 +1349,12 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 
     /* minint/maxint: per-axis min/max of integer coordinates (for range encoding).
      * mindiff: minimum Manhattan distance between successive coordinate triples
-     *          (used to choose initial compression level).
+     *          (used to choose initial compression level), with the 32-bit
+     *          wraparound of earlier versions; see wrapped_manhattan_distance().
      */
-    int minint[3], maxint[3], mindiff, *lip, diff;
-    int lint1, lint2, lint3, oldlint1, oldlint2, oldlint3, smallidx;
+    int minint[3], maxint[3], *lip;
+    int mindiff, diff;
+    int smallidx;
     int minidx, maxidx;
     /* sizeint: per-axis range (max - min + 1) for absolute coordinate encoding.
      * sizesmall: per-axis range for difference encoding (set to magicints[smallidx]).
@@ -1050,26 +1367,22 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
      * fit within the current encoding window.
      */
     int small, smaller, larger, i, is_small, is_smaller, run, prevrun;
-    float *lfp, lf;
+    float *lfp;
     int tmp, *thiscoord,  prevcoord[3];
     unsigned int tmpcoord[30];  /* Temp buffer for up to 10 coordinate triples in a run */
 
-    int xdrid, lsize;
+    int lsize;
     unsigned int bitsize;
     float inv_precision;
-    int errval = 1;
+    size_t buf_capacity_bytes, bytes_declared;
 
-    /* find out if xdrs is opened for reading or for writing.
-     * An unknown stream is a caller error, but reporting it through the
-     * documented 0 return is friendlier than exiting the whole program.
+    /* xdr3dfcoord only works on streams from xdropen(). An unknown or NULL
+     * stream is a caller error, but reporting it through the documented 0
+     * return is friendlier than exiting (or crashing) the whole program.
      */
-    xdrid = 0;
-    while (xdridptr[xdrid] != xdrs) {
-	xdrid++;
-	if (xdrid >= MAXID) {
-	    fprintf(stderr, "xdr error. no open xdr stream\n");
-	    return 0;
-	}
+    if (slot_of_stream(xdrs) == 0) {
+	fprintf(stderr, "xdr error. no open xdr stream\n");
+	return 0;
     }
     /* Everything downstream works in units of 3 ints per atom, so reject
      * counts whose triple would not fit in an int before computing it.
@@ -1078,21 +1391,39 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	fprintf(stderr, "xdr3dfcoord: bad size %d\n", *size);
 	return 0;
     }
-    if ((xdrmodes[xdrid] == 'w') || (xdrmodes[xdrid] == 'a')) {
+    if (xdrs->x_op == XDR_ENCODE) {
 
 	/* xdrs is open for writing */
 
-	if (xdr_int(xdrs, size) == 0)
-	    return 0;
 	size3 = *size * 3;
 	/* when the number of coordinates is small, don't try to compress; just
-	 * write them as floats using xdr_vector
+	 * write them as floats
 	 */
 	if (*size <= 9 ) {
+	    if (xdr_int(xdrs, size) == 0)
+		return 0;
 	    return xdr_float_array(xdrs, fp, size3);
 	}
-	
-	xdr_float(xdrs, precision);
+
+	/* Every check on the input happens before the first byte of the
+	 * frame is written, so a frame that cannot be stored fails without
+	 * touching the stream. Earlier versions wrote the header, noted the
+	 * problem, and went on to encode and write the whole (garbage) frame
+	 * before returning 0.
+	 *
+	 * A zero or non-finite precision maps every coordinate to the same
+	 * integer (or to nothing), and the reader then divides by it; the
+	 * call used to succeed and the data came back as NaN.
+	 */
+	/* A negative precision is refused too: the rounding below assumes a
+	 * positive one, and with a negative precision coordinates came back
+	 * with up to three times the error that 0.5/precision promises.
+	 */
+	if (!(*precision > 0.0f) || !isfinite(*precision)) {
+	    fprintf(stderr, "xdr3dfcoord: precision %g cannot store "
+		    "coordinates\n", (double) *precision);
+	    return 0;
+	}
 	if (ensure_buffers(*size) == 0)
 	    return 0;
 	ip = coord_ip;
@@ -1107,81 +1438,77 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	minint[0] = minint[1] = minint[2] = INT_MAX;
 	maxint[0] = maxint[1] = maxint[2] = INT_MIN;
 	prevrun = -1;
-	lfp = fp;
 	lip = ip;
 	mindiff = INT_MAX;
-	oldlint1 = oldlint2 = oldlint3 = 0;
 	/* PASS 1: Convert all float coordinates to fixed-point integers
 	 * by multiplying by precision and rounding. Track per-axis
-	 * min/max and the minimum inter-coordinate Manhattan distance.
+	 * min/max and the minimum inter-coordinate Manhattan distance
+	 * (between consecutive atoms, so starting from the second one).
 	 */
-	while(lfp < fp + size3 ) {
-	    /* find nearest integer */
-	    if (*lfp >= 0.0)
-		lf = *lfp * *precision + 0.5;
-	    else
-		lf = *lfp * *precision - 0.5;
-	    if (fabs(lf) > MAXABS) {
-		/* scaling would cause overflow */
-		errval = 0;
+	for (i = 0; i < *size; i++) {
+	    for (k = 0; k < 3; k++) {
+		if (scale_coordinate(fp[3 * i + k], *precision, &lip[k]) == 0) {
+		    fprintf(stderr, "xdr3dfcoord: coordinate %d of atom %d (%g) "
+			    "is not finite or too large for precision %g\n",
+			    k, i, (double) fp[3 * i + k], (double) *precision);
+		    return 0;
+		}
+		if (lip[k] < minint[k]) minint[k] = lip[k];
+		if (lip[k] > maxint[k]) maxint[k] = lip[k];
 	    }
-	    lint1 = lf;
-	    if (lint1 < minint[0]) minint[0] = lint1;
-	    if (lint1 > maxint[0]) maxint[0] = lint1;
-	    *lip++ = lint1;
-	    lfp++;
-	    if (*lfp >= 0.0)
-		lf = *lfp * *precision + 0.5;
-	    else
-		lf = *lfp * *precision - 0.5;
-	    if (fabs(lf) > MAXABS) {
-		/* scaling would cause overflow */
-		errval = 0;
+	    if (i > 0) {
+		diff = wrapped_manhattan_distance(lip, lip - 3);
+		if (diff < mindiff)
+		    mindiff = diff;
 	    }
-	    lint2 = lf;
-	    if (lint2 < minint[1]) minint[1] = lint2;
-	    if (lint2 > maxint[1]) maxint[1] = lint2;
-	    *lip++ = lint2;
-	    lfp++;
-	    if (*lfp >= 0.0)
-		lf = *lfp * *precision + 0.5;
-	    else
-		lf = *lfp * *precision - 0.5;
-	    if (fabs(lf) > MAXABS) {
-		/* scaling would cause overflow */
-		errval = 0;
-	    }
-	    lint3 = lf;
-	    if (lint3 < minint[2]) minint[2] = lint3;
-	    if (lint3 > maxint[2]) maxint[2] = lint3;
-	    *lip++ = lint3;
-	    lfp++;
-	    diff = abs(oldlint1-lint1)+abs(oldlint2-lint2)+abs(oldlint3-lint3);
-	    if (diff < mindiff && lfp > fp + 3)
-		mindiff = diff;
-	    oldlint1 = lint1;
-	    oldlint2 = lint2;
-	    oldlint3 = lint3;
+	    lip += 3;
 	}
+	/* Offsets from minint are encoded as unsigned values below
+	 * 2^31, so each axis range must stay under MAXABS. The check is done
+	 * in double, which is exact here. It used to subtract in float, which
+	 * rounded spans within about 60 scaled units of 2^31 up to 2^31 and so
+	 * refused a few frames that can in fact be stored; it never let an
+	 * oversized one through.
+	 */
+	for (k = 0; k < 3; k++) {
+	    if ((double) maxint[k] - (double) minint[k] >= MAXABS) {
+		fprintf(stderr, "xdr3dfcoord: coordinates span too large a "
+			"range for precision %g\n", (double) *precision);
+		return 0;
+	    }
+	}
+	/* The reader turns each integer back into a float as
+	 * integer * (1 / precision), in float. For a tiny precision that
+	 * overflows -- a subnormal precision, or one near FLT_MIN with
+	 * coordinates near FLT_MAX -- and the frame was written successfully
+	 * only to read back as inf or NaN. The extremes are at minint and
+	 * maxint, so computing those two exactly as the reader does is enough.
+	 */
+	inv_precision = 1.0 / *precision;
+	for (k = 0; k < 3; k++) {
+	    float lowest = minint[k] * inv_precision;
+	    float highest = maxint[k] * inv_precision;
+	    if (!isfinite(lowest) || !isfinite(highest)) {
+		fprintf(stderr, "xdr3dfcoord: coordinates would not read back "
+			"as finite numbers at precision %g\n", (double) *precision);
+		return 0;
+	    }
+	}
+
+	/* The frame is valid: from here on it is written out. */
+	if (xdr_int(xdrs, size) == 0 || xdr_float(xdrs, precision) == 0)
+	    return 0;
 	/* Write the per-axis min and max values to the stream.
 	 * These are needed by the reader to reconstruct absolute
 	 * coordinates from the compressed (offset-from-minimum) form.
 	 */
-	xdr_int(xdrs, &(minint[0]));
-	xdr_int(xdrs, &(minint[1]));
-	xdr_int(xdrs, &(minint[2]));
-	
-	xdr_int(xdrs, &(maxint[0]));
-	xdr_int(xdrs, &(maxint[1]));
-	xdr_int(xdrs, &(maxint[2]));
-	
-	if ((float)maxint[0] - (float)minint[0] >= MAXABS ||
-		(float)maxint[1] - (float)minint[1] >= MAXABS ||
-		(float)maxint[2] - (float)minint[2] >= MAXABS) {
-	    /* turning value in unsigned by subtracting minint
-	     * would cause overflow
-	     */
-	    errval = 0;
+	for (k = 0; k < 3; k++) {
+	    if (xdr_int(xdrs, &(minint[k])) == 0)
+		return 0;
+	}
+	for (k = 0; k < 3; k++) {
+	    if (xdr_int(xdrs, &(maxint[k])) == 0)
+		return 0;
 	}
 	/* Unsigned: the span can exceed INT_MAX, and on read min/max come
 	 * straight from the file.
@@ -1210,7 +1537,8 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	while (smallidx < LASTIDX - 1 && magicints[smallidx] < mindiff) {
 	    smallidx++;
 	}
-	xdr_int(xdrs, &smallidx);
+	if (xdr_int(xdrs, &smallidx) == 0)
+	    return 0;
 	/* Clamp to the last valid entry: LASTIDX is the table's element
 	 * count, so magicints[LASTIDX] is one past the end.
 	 */
@@ -1262,9 +1590,8 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 		}
     
 	    }
-	    /* Offset from the per-axis minimum, in unsigned arithmetic: the
-	     * range check above already flags spans wider than MAXABS via
-	     * errval, but the subtraction itself must not overflow first.
+	    /* Offset from the per-axis minimum, in unsigned arithmetic. The
+	     * range check above guarantees it is below 2^31.
 	     */
 	    tmpcoord[0] = (unsigned int)thiscoord[0] - (unsigned int)minint[0];
 	    tmpcoord[1] = (unsigned int)thiscoord[1] - (unsigned int)minint[1];
@@ -1286,10 +1613,12 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	    if (is_small == 0 && is_smaller == -1)
 		is_smaller = 0;
 	    while (is_small && run < 8*3) {
-		if (is_smaller == -1 && (
-			SQR(thiscoord[0] - prevcoord[0]) +
-			SQR(thiscoord[1] - prevcoord[1]) +
-			SQR(thiscoord[2] - prevcoord[2]) >= smaller * smaller)) {
+		/* Only step down a level if this difference also fits the
+		 * finer one. Both sides wrap as the original int arithmetic
+		 * did; see wrapped_sqr_distance() for why that is kept. */
+		if (is_smaller == -1 &&
+			wrapped_sqr_distance(thiscoord, prevcoord) >=
+			wrapped_int((unsigned int) smaller * (unsigned int) smaller)) {
 		    is_smaller = 0;
 		}
 
@@ -1335,8 +1664,9 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	}
 	if (buf[1] != 0) buf[0]++; /* Account for any remaining partial byte */
 	/* Write the compressed data: first the byte count, then the raw bytes */
-	xdr_int(xdrs, &(buf[0])); /* buf[0] holds the length in bytes */
-	return errval * (xdr_opaque(xdrs, (caddr_t)&(buf[3]), (u_int)buf[0]));
+	if (xdr_int(xdrs, &(buf[0])) == 0) /* buf[0] holds the length in bytes */
+	    return 0;
+	return xdr_opaque(xdrs, (caddr_t)&(buf[3]), (u_int)buf[0]);
     } else {
 	
 	/* ================================================================
@@ -1371,7 +1701,19 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	if (*size <= 9) {
 	    return xdr_float_array(xdrs, fp, size3);
 	}
-	xdr_float(xdrs, precision);
+	/* Every header field is checked as it is read: on a truncated file a
+	 * failed read leaves its variable uninitialised, and those values
+	 * used to be used regardless. A zero or non-finite precision cannot
+	 * come from a valid writer and would turn every coordinate into
+	 * inf or NaN below.
+	 */
+	if (xdr_float(xdrs, precision) == 0)
+	    return 0;
+	if (*precision == 0.0f || !isfinite(*precision)) {
+	    fprintf(stderr, "xdr3dfcoord: invalid precision %g in file\n",
+		    (double) *precision);
+	    return 0;
+	}
 	if (ensure_buffers(*size) == 0)
 	    return 0;
 	ip = coord_ip;
@@ -1379,13 +1721,14 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	buf[0] = buf[1] = buf[2] = 0;
 
 	/* Read per-axis min/max used to reconstruct absolute coordinates */
-	xdr_int(xdrs, &(minint[0]));
-	xdr_int(xdrs, &(minint[1]));
-	xdr_int(xdrs, &(minint[2]));
-
-	xdr_int(xdrs, &(maxint[0]));
-	xdr_int(xdrs, &(maxint[1]));
-	xdr_int(xdrs, &(maxint[2]));
+	for (k = 0; k < 3; k++) {
+	    if (xdr_int(xdrs, &(minint[k])) == 0)
+		return 0;
+	}
+	for (k = 0; k < 3; k++) {
+	    if (xdr_int(xdrs, &(maxint[k])) == 0)
+		return 0;
+	}
 
 	/* A maximum below the minimum is impossible in a frame this library
 	 * wrote. Left unchecked it yields sizeint[] == 0, and receiveints()
@@ -1403,7 +1746,18 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	sizeint[0] = (unsigned int)maxint[0] - (unsigned int)minint[0] + 1;
 	sizeint[1] = (unsigned int)maxint[1] - (unsigned int)minint[1] + 1;
 	sizeint[2] = (unsigned int)maxint[2] - (unsigned int)minint[2] + 1;
-	
+
+	/* The other way to get a zero divisor: min = INT_MIN and max =
+	 * INT_MAX on one axis is a range of 2^32 values, which wraps sizeint
+	 * to 0. No writer can produce it (it rejects ranges of MAXABS and
+	 * up), so it can only be corruption.
+	 */
+	if (sizeint[0] == 0 || sizeint[1] == 0 || sizeint[2] == 0) {
+	    fprintf(stderr, "xdr3dfcoord: coordinate range in file is too "
+		    "large\n");
+	    return 0;
+	}
+
 	/* check if one of the sizes is to big to be multiplied */
 	if ((sizeint[0] | sizeint[1] | sizeint[2] ) > 0xffffff) {
 	    bitsizeint[0] = sizeofint(sizeint[0]);
@@ -1438,13 +1792,16 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 	    return 0;
 	/* The byte count is attacker-controlled for an untrusted file, so
 	 * check it against the space actually available before letting
-	 * xdr_opaque() fill the buffer.
+	 * xdr_opaque() fill the buffer. The capacity is computed in size_t:
+	 * in int it overflowed for frames above about 150 million atoms.
 	 */
-	if (buf[0] < 0 || buf[0] > (coord_bufints - 3) * (int)sizeof(*buf)) {
+	buf_capacity_bytes = (size_t)(coord_bufints - 3) * sizeof(*buf);
+	if (buf[0] < 0 || (size_t)buf[0] > buf_capacity_bytes) {
 	    fprintf(stderr, "xdr3dfcoord: compressed block of %d bytes does "
 		    "not fit the buffer for %d atoms\n", buf[0], lsize);
 	    return 0;
 	}
+	bytes_declared = (size_t)buf[0];
 	if (xdr_opaque(xdrs, (caddr_t)&(buf[3]), (u_int)buf[0]) == 0)
 	    return 0;
 	buf[0] = buf[1] = buf[2] = 0;  /* Reset bit-unpacking state */
@@ -1560,6 +1917,18 @@ int xdr3dfcoord(XDR *xdrs, float *fp, int *size, float *precision) {
 		small = magicints[smallidx] / 2;
 	    }
 	    sizesmall[0] = sizesmall[1] = sizesmall[2] = magicints[smallidx] ;
+	}
+	/* buf[0] now counts the bytes the decoder actually consumed. A valid
+	 * frame never needs more than it declared; a corrupt one that does
+	 * was decoded partly from bytes left in the buffer by earlier frames
+	 * (or never initialised), and used to come back as success. The reads
+	 * themselves stay inside the allocation: no atom takes more than 102
+	 * bits, and ensure_buffers() allows 14.4 bytes per atom.
+	 */
+	if ((size_t)buf[0] > bytes_declared) {
+	    fprintf(stderr, "xdr3dfcoord: compressed block of %d bytes is too "
+		    "short for its %d atoms\n", (int)bytes_declared, lsize);
+	    return 0;
 	}
     }
     return 1;
